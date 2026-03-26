@@ -116,10 +116,7 @@ impl eframe::App for ClingfunApp {
             ui.add_space(12.0);
             ui.group(|ui| {
                 ui.heading("Question");
-                ui.label(format!(
-                    "Does the string {:?} belong to the language?",
-                    self.state.puzzle.test_string()
-                ));
+                ui.label(self.state.puzzle.prompt());
             });
 
             ui.add_space(12.0);
@@ -257,21 +254,23 @@ fn yes_no(value: bool) -> &'static str {
 
 enum Puzzle {
     Dfa(DfaPuzzle),
+    Fst(FstPuzzle),
     Cfg(CfgPuzzle),
 }
 
 impl Puzzle {
     fn generate(rng: &mut SimpleRng) -> Self {
-        if rng.gen_bool() {
-            Self::Dfa(DfaPuzzle::generate(rng))
-        } else {
-            Self::Cfg(CfgPuzzle::generate(rng))
+        match rng.gen_range(0, 3) {
+            0 => Self::Dfa(DfaPuzzle::generate(rng)),
+            1 => Self::Fst(FstPuzzle::generate(rng)),
+            _ => Self::Cfg(CfgPuzzle::generate(rng)),
         }
     }
 
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Dfa(_) => "FSA",
+            Self::Fst(_) => "FST",
             Self::Cfg(_) => "CFG",
         }
     }
@@ -279,6 +278,7 @@ impl Puzzle {
     fn title(&self) -> &'static str {
         match self {
             Self::Dfa(_) => "Finite State Automaton",
+            Self::Fst(_) => "Finite State Transducer",
             Self::Cfg(_) => "Context-Free Grammar",
         }
     }
@@ -286,22 +286,17 @@ impl Puzzle {
     fn show(&self, ui: &mut egui::Ui) {
         match self {
             Self::Dfa(puzzle) => puzzle.show(ui),
+            Self::Fst(puzzle) => puzzle.show(ui),
             Self::Cfg(puzzle) => {
                 ui.monospace(puzzle.render());
             }
         }
     }
 
-    fn test_string(&self) -> &str {
-        match self {
-            Self::Dfa(puzzle) => &puzzle.input,
-            Self::Cfg(puzzle) => &puzzle.input,
-        }
-    }
-
     fn is_match(&self) -> bool {
         match self {
             Self::Dfa(puzzle) => puzzle.is_match(),
+            Self::Fst(puzzle) => puzzle.is_match(),
             Self::Cfg(puzzle) => puzzle.is_match(),
         }
     }
@@ -309,7 +304,23 @@ impl Puzzle {
     fn explanation(&self) -> String {
         match self {
             Self::Dfa(puzzle) => puzzle.explanation(),
+            Self::Fst(puzzle) => puzzle.explanation(),
             Self::Cfg(puzzle) => puzzle.explanation(),
+        }
+    }
+
+    fn prompt(&self) -> String {
+        match self {
+            Self::Dfa(puzzle) => {
+                format!("Does the string {:?} belong to the language?", puzzle.input)
+            }
+            Self::Fst(puzzle) => format!(
+                "Does this transducer map input {:?} to output {:?}?",
+                puzzle.input, puzzle.candidate_output
+            ),
+            Self::Cfg(puzzle) => {
+                format!("Does the string {:?} belong to the language?", puzzle.input)
+            }
         }
     }
 }
@@ -490,6 +501,173 @@ impl DfaPuzzle {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FstEdge {
+    target: usize,
+    output: char,
+}
+
+struct FstPuzzle {
+    transitions: Vec<[FstEdge; 2]>,
+    input: String,
+    candidate_output: String,
+    actual_output: String,
+    trace: Vec<usize>,
+}
+
+impl FstPuzzle {
+    fn generate(rng: &mut SimpleRng) -> Self {
+        let states = rng.gen_range(3, 6);
+        let mut transitions = Vec::with_capacity(states);
+        for _ in 0..states {
+            transitions.push([
+                FstEdge {
+                    target: rng.gen_range(0, states),
+                    output: if rng.gen_bool() { 'a' } else { 'b' },
+                },
+                FstEdge {
+                    target: rng.gen_range(0, states),
+                    output: if rng.gen_bool() { 'a' } else { 'b' },
+                },
+            ]);
+        }
+
+        let input_len = rng.gen_range(3, 8);
+        let input = random_binary_string(rng, input_len);
+        let (trace, actual_output) = run_fst(&transitions, &input);
+        let candidate_output = if rng.gen_bool() {
+            actual_output.clone()
+        } else {
+            mutate_output_string(rng, &actual_output)
+        };
+
+        Self {
+            transitions,
+            input,
+            candidate_output,
+            actual_output,
+            trace,
+        }
+    }
+
+    fn is_match(&self) -> bool {
+        self.actual_output == self.candidate_output
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "Input alphabet: {0, 1}\nOutput alphabet: {a, b}\nStart state: q0\n\nTransitions\n",
+        );
+        for (state, [on_zero, on_one]) in self.transitions.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  q{state}: 0/{} -> q{}, 1/{} -> q{}",
+                on_zero.output, on_zero.target, on_one.output, on_one.target
+            );
+        }
+        out
+    }
+
+    fn show(&self, ui: &mut egui::Ui) {
+        ui.label("Input alphabet: {0, 1}. Output alphabet: {a, b}. Start state: q0.");
+
+        let desired_size = vec2(ui.available_width().max(320.0), 320.0);
+        let (rect, _) = ui.allocate_exact_size(desired_size, Sense::hover());
+        let painter = ui.painter_at(rect);
+        self.paint(&painter, rect);
+
+        ui.add_space(6.0);
+        ui.collapsing("Transition table", |ui| {
+            ui.monospace(self.render());
+        });
+    }
+
+    fn paint(&self, painter: &egui::Painter, rect: Rect) {
+        let radius = 26.0;
+        let node_count = self.transitions.len();
+        let positions = layout_positions(rect, node_count);
+
+        painter.rect_filled(rect.shrink(4.0), 10.0, Color32::from_rgb(15, 27, 42));
+
+        for source in 0..node_count {
+            for symbol_idx in 0..2 {
+                let edge = self.transitions[source][symbol_idx];
+                let label = format!(
+                    "{}/{}",
+                    if symbol_idx == 0 { '0' } else { '1' },
+                    edge.output
+                );
+
+                if source == edge.target {
+                    draw_self_loop(
+                        painter,
+                        positions[source],
+                        radius,
+                        loop_direction(source),
+                        &label,
+                        Color32::from_rgb(139, 197, 255),
+                    );
+                } else {
+                    let reverse_exists = self.transitions[edge.target][0].target == source
+                        || self.transitions[edge.target][1].target == source;
+                    let bend = if reverse_exists {
+                        if source < edge.target { 34.0 } else { -34.0 }
+                    } else {
+                        0.0
+                    };
+                    draw_directed_edge(
+                        painter,
+                        positions[source],
+                        positions[edge.target],
+                        radius,
+                        bend,
+                        &label,
+                        Color32::from_rgb(139, 197, 255),
+                    );
+                }
+            }
+        }
+
+        draw_start_arrow(
+            painter,
+            positions[0],
+            radius,
+            Color32::from_rgb(255, 214, 102),
+        );
+
+        for (idx, position) in positions.into_iter().enumerate() {
+            let fill = if idx == 0 {
+                Color32::from_rgb(36, 63, 92)
+            } else {
+                Color32::from_rgb(27, 45, 66)
+            };
+            painter.circle_filled(position, radius, fill);
+            painter.circle_stroke(position, radius, Stroke::new(2.0, Color32::WHITE));
+            painter.text(
+                position,
+                Align2::CENTER_CENTER,
+                format!("q{idx}"),
+                FontId::proportional(18.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    fn explanation(&self) -> String {
+        let path = self
+            .trace
+            .iter()
+            .map(|state| format!("q{state}"))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        format!(
+            "Trace: {}. Actual output for {:?} is {:?}.",
+            path, self.input, self.actual_output
+        )
+    }
+}
+
 fn draw_start_arrow(painter: &egui::Painter, target: Pos2, radius: f32, color: Color32) {
     let start = target + vec2(-radius - 42.0, 0.0);
     let end = target + vec2(-radius, 0.0);
@@ -530,18 +708,34 @@ fn draw_directed_edge(
     let delta = target - source;
     let distance = delta.length().max(1.0);
     let dir = delta / distance;
-    let perp = vec2(-dir.y, dir.x);
     let start = source + dir * radius;
     let end = target - dir * radius;
-    let control = pos2((start.x + end.x) * 0.5, (start.y + end.y) * 0.5) + perp * bend;
+    let midpoint = pos2((start.x + end.x) * 0.5, (start.y + end.y) * 0.5);
+    let curve_normal = canonical_curve_normal(source, target);
+    let control = midpoint + curve_normal * bend;
     let curve = quadratic_points(start, control, end, 24);
-    let label_anchor =
-        quadratic_point(start, control, end, 0.5) + perp * if bend == 0.0 { 12.0 } else { 14.0 };
+    let label_anchor = quadratic_point(start, control, end, 0.5)
+        + curve_normal
+            * if bend == 0.0 {
+                12.0
+            } else {
+                bend.signum() * 14.0
+            };
 
     painter.add(Shape::line(curve.clone(), Stroke::new(2.0, color)));
     let before_tip = curve[curve.len() - 2];
     draw_arrow_head(painter, end, end - before_tip, color);
     draw_edge_label(painter, label_anchor, label, color);
+}
+
+fn canonical_curve_normal(a: Pos2, b: Pos2) -> Vec2 {
+    let (start, end) = if a.x < b.x || (a.x == b.x && a.y <= b.y) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let dir = (end - start).normalized();
+    vec2(-dir.y, dir.x)
 }
 
 fn draw_arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color32) {
@@ -665,6 +859,20 @@ fn run_dfa(transitions: &[[usize; 2]], input: &str) -> Vec<usize> {
         trace.push(state);
     }
     trace
+}
+
+fn run_fst(transitions: &[[FstEdge; 2]], input: &str) -> (Vec<usize>, String) {
+    let mut state = 0;
+    let mut trace = vec![state];
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let index = if ch == '0' { 0 } else { 1 };
+        let edge = transitions[state][index];
+        output.push(edge.output);
+        state = edge.target;
+        trace.push(state);
+    }
+    (trace, output)
 }
 
 struct CfgPuzzle {
@@ -854,6 +1062,17 @@ fn random_ab_string(rng: &mut SimpleRng, len: usize) -> String {
         out.push(if rng.gen_bool() { 'a' } else { 'b' });
     }
     out
+}
+
+fn mutate_output_string(rng: &mut SimpleRng, original: &str) -> String {
+    let mut chars: Vec<char> = original.chars().collect();
+    if chars.is_empty() {
+        return "a".to_string();
+    }
+
+    let idx = rng.gen_range(0, chars.len());
+    chars[idx] = if chars[idx] == 'a' { 'b' } else { 'a' };
+    chars.into_iter().collect()
 }
 
 fn shuffled_binary_string(rng: &mut SimpleRng, zero_count: usize, one_count: usize) -> String {

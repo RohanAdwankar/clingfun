@@ -3,7 +3,7 @@ name: Deploy Pages
 on:
   push:
     branches:
-      - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -34,7 +34,7 @@ jobs:
         run: cargo install trunk --locked
 
       - name: Build Site
-        run: trunk build --release site/index.html
+        run: trunk build site/index.html --release
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
